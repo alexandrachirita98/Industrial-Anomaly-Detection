@@ -23,16 +23,31 @@ LABELS = {"autovi_iid": "IID", "autovi": "Group (real)",
           "autovi_dir_a1.0": "Dirichlet a=1.0", "autovi_dir_a0.1": "Dirichlet a=0.1"}
 
 
-def emds() -> dict[str, float]:
+# Fallback EMDs, used only when the heterogeneity CSV is absent (e.g. on the
+# cluster, where Member 1's notebook has not run). Measured values, seed 42.
+FALLBACK_EMD = {"autovi_iid": 0.028, "autovi": 0.139,
+                "autovi_dir_a1.0": 0.387, "autovi_dir_a0.1": 0.554}
+
+
+def emds() -> tuple[dict[str, float], str]:
+    """mean_EMD per split, and where it came from.
+
+    The CSV is the authority, but it lives in outputs/ which is git-ignored, so
+    it is often missing on the cluster. Falling back silently would leave the
+    heterogeneity column blank AND make the row order depend on dict insertion
+    order rather than on the data, so say which source was used.
+    """
     csv = REPO / "outputs" / "tables" / "stage1_split_heterogeneity.csv"
-    out: dict[str, float] = {}
     if not csv.exists():
-        return out
+        return dict(FALLBACK_EMD), f"built-in fallback ({csv.name} not found)"
     import csv as _csv
+    out: dict[str, float] = {}
     for row in _csv.DictReader(csv.open()):
         if row.get("partition_dir"):
             out[row["partition_dir"]] = float(row["mean_EMD"])
-    return out
+    if not out:
+        return dict(FALLBACK_EMD), f"built-in fallback ({csv.name} has no partition_dir)"
+    return out, str(csv.relative_to(REPO))
 
 
 def stat(d: dict | None, *keys):
@@ -86,7 +101,7 @@ def main() -> None:
                     help="the round count arm B was supposed to train for")
     args = ap.parse_args()
 
-    e = emds()
+    e, emd_source = emds()
     order = sorted(LABELS, key=lambda k: e.get(k, 9))
     missing: list[str] = []
     rows = []
@@ -125,6 +140,7 @@ def main() -> None:
 
     # ---------------------------------------------------------- view 1: the headline
     print("\n### A vs B by split (validation balanced accuracy, mean ± std over seeds)\n")
+    print(f"<!-- heterogeneity ordering from: {emd_source} -->")
     print("| Split | mean_EMD | A centralised | B federated | A−B gap | rounds |")
     print("|---|---|---|---|---|---|")
     for r in rows:
