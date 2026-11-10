@@ -34,6 +34,11 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 # without it np.linalg.inv raises LinAlgError on near-singular matrices.
 COV_EPS = 0.01
 
+# Channels in the multi-scale embedding: resnet18 layer1 + layer2 + layer3.
+# Fixed by the backbone, so the channel subset can be drawn before embedding
+# anything - which is what lets the server choose it for the whole federation.
+EMBED_CHANNELS = 64 + 128 + 256  # = 448
+
 
 def _blur(m: np.ndarray, sigma: float) -> np.ndarray:
     """Gaussian smoothing of one (H, W) anomaly map."""
@@ -82,30 +87,57 @@ class PaDiM:
             F.interpolate(f3, size=size, mode="nearest"),
         ], dim=1)             # (B, 448, 32, 32)
 
+    def _draw_channels(self, idx: np.ndarray | None) -> None:
+        """Set self.idx: the given subset, or a fresh one drawn from self.seed.
+
+        Drawing it from the seed is the only stochastic part of PaDiM, so it is
+        the only source of seed variance. In the federated setting the server
+        passes idx in, because every client MUST use the same subset (channel i
+        of one client is averaged with channel i of another).
+        """
+        if idx is None:
+            rng = np.random.default_rng(self.seed)
+            idx = rng.choice(EMBED_CHANNELS, size=self.n_dims, replace=False)
+        self.idx = torch.as_tensor(np.asarray(idx, dtype=np.int64))
+
     @torch.no_grad()
-    def fit(self, x: np.ndarray, batch_size: int = 32) -> None:
-        """x: (N, 3, H, W) float32 in [0,1], NORMAL images only."""
+    def _embed_all(self, x: np.ndarray, batch_size: int) -> torch.Tensor:
+        """(N, 3, H, W) -> (N, n_dims, h, w) on the CPU, batched to bound memory.
+
+        Selects self.idx inside the loop, so only n_dims channels are ever kept:
+        at n_dims=100 that is 4.5x less memory than holding all 448.
+        Requires self.idx to be set already (_draw_channels).
+        """
+        idx = self.idx.to(self.device)
+        out = []
+        for i in range(0, len(x), batch_size):
+            batch = torch.from_numpy(x[i:i + batch_size]).to(self.device)
+            out.append(self._embed(batch)[:, idx].cpu())
+        return torch.cat(out)                        # (N, n_dims, h, w)
+
+    @torch.no_grad()
+    def fit(self, x: np.ndarray, batch_size: int = 32,
+            idx: np.ndarray | None = None) -> None:
+        """x: (N, 3, H, W) float32 in [0,1], NORMAL images only.
+
+        idx: the channel subset to use. None (default) draws it from self.seed,
+        as the paper does. Pass it in the federated setting, where the server
+        chooses one subset for the whole federation (see experiments/padim_federated.py).
+        """
         if len(x) <= self.n_dims:
             raise ValueError(
                 f"{len(x)} training images for n_dims={self.n_dims}: the per-patch "
                 "covariance is singular. Use more images or a smaller --n-dims.")
 
-        embeddings = []
-        for i in range(0, len(x), batch_size):
-            batch = torch.from_numpy(x[i:i + batch_size]).to(self.device)
-            embeddings.append(self._embed(batch).cpu())
-        emb = torch.cat(embeddings)                  # (N, 448, h, w)
-
-        # Draw the random channel subset ONCE, reproducibly. This is the only
-        # stochastic part of PaDiM, so it is the only source of seed variance.
-        rng = np.random.default_rng(self.seed)
-        self.idx = torch.from_numpy(
-            rng.choice(emb.shape[1], size=self.n_dims, replace=False))
-        emb = emb[:, self.idx]                       # (N, n_dims, h, w)
+        self._draw_channels(idx)
+        emb = self._embed_all(x, batch_size)         # (N, n_dims, h, w)
 
         n, d, h, w = emb.shape
         self.grid = (h, w)
-        emb = emb.reshape(n, d, h * w).numpy()       # (N, d, n_patches)
+        # float64: the mean and covariance are sums over N images, and in float32
+        # the accumulation costs ~1e-6 of precision. Cheap here, and it makes this
+        # path agree exactly with the federated aggregation in padim_federated.py.
+        emb = emb.reshape(n, d, h * w).double().numpy()   # (N, d, n_patches)
 
         self.mean = emb.mean(axis=0).T               # (n_patches, d)
         inv = np.empty((h * w, d, d), dtype=np.float64)
@@ -116,6 +148,65 @@ class PaDiM:
             cov = np.cov(emb[:, :, p], rowvar=False) + COV_EPS * eye
             inv[p] = np.linalg.inv(cov)
         self.inv_cov = inv
+
+    @torch.no_grad()
+    def local_statistics(self, x: np.ndarray, idx: np.ndarray,
+                         batch_size: int = 32) -> dict:
+        """Sufficient statistics of one client's NORMAL images, for federation.
+
+        Returns {"n": int, "S": (n_patches, d), "Q": (n_patches, d, d), "grid": (h, w)}
+        where S = sum of embeddings and Q = sum of outer products, per patch
+        position. Mean and covariance are reconstructible EXACTLY from these sums,
+        so the server can build the same model it would have built on the pooled
+        images. No image, and no per-image quantity, leaves the client.
+
+        Deliberately does NOT invert anything: inv(mean) != mean(inv), so the
+        server must sum the second moments and invert once (trap 2 of the guide).
+        """
+        if len(x) == 0:
+            raise ValueError("no training images: nothing to compute statistics from")
+        self._draw_channels(idx)                     # server-chosen, never drawn here
+
+        # Accumulated batch by batch, never holding the whole embedding: client
+        # memory then depends on batch_size, not on how many images the client
+        # owns. S and Q are sums, so batching them is exact.
+        #
+        # float64: Q accumulates sums of squares, and the cancellation in
+        # Q/n - mu mu^T can cost several significant digits in float32 (and even
+        # yield a non-PSD matrix). COV_EPS hides a lot; do not rely on it to hide
+        # a numerical bug.
+        d = self.n_dims
+        n_seen, grid, S, Q = 0, None, None, None
+        for i in range(0, len(x), batch_size):
+            batch = torch.from_numpy(x[i:i + batch_size]).to(self.device)
+            emb = self._embed(batch)[:, self.idx.to(self.device)].cpu()
+            b, _, h, w = emb.shape
+            if S is None:
+                grid = (h, w)
+                S = np.zeros((h * w, d), dtype=np.float64)
+                Q = np.zeros((h * w, d, d), dtype=np.float64)
+            elif grid != (h, w):
+                raise ValueError(
+                    f"batch {i // batch_size} has grid {(h, w)}, expected {grid}: "
+                    "the client's images are not all the same size.")
+            e = emb.reshape(b, d, h * w).permute(2, 0, 1).double().numpy()  # (p, b, d)
+            S += e.sum(axis=1)
+            Q += np.einsum("pnd,pne->pde", e, e)
+            n_seen += b
+
+        return {"n": int(n_seen), "S": S, "Q": Q, "grid": grid}
+
+    def load_statistics(self, mean: np.ndarray, inv_cov: np.ndarray,
+                        idx: np.ndarray, grid: tuple[int, int]) -> None:
+        """Make this instance scorable from an aggregated model (no fit, no images).
+
+        The server side of federation: score() only reads mean, inv_cov and idx,
+        so a model assembled from clients' statistics scores exactly like a fitted one.
+        """
+        self.mean = np.asarray(mean)
+        self.inv_cov = np.asarray(inv_cov)
+        self.idx = torch.as_tensor(np.asarray(idx, dtype=np.int64))
+        self.grid = tuple(grid)
 
     @torch.no_grad()
     def score(self, x: np.ndarray, batch_size: int = 32, sigma: float = 4.0,

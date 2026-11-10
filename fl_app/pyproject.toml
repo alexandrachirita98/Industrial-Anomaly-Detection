@@ -78,6 +78,18 @@ attack-inflate-examples = 1 # attackers multiply the num-examples they report (F
 # round (for learning curves in the report, NOT for choosing settings).
 test-every-round = false
 
+# --- Federated PaDiM (one round, no gradients) -----------------------------
+# padim-mode = true switches BOTH apps to the PaDiM implementation
+# (padim_server_app / padim_client_app). See
+# brainstorming/stage2_federated_padim_implementation_guide.md.
+# In this mode num-server-rounds, local-epochs, learning-rate, loss-weighting,
+# strategy and every dp-* / attack key are IGNORED: there are no gradients and
+# no model updates to average, clip or poison.
+padim-mode = false
+padim-n-dims = 100          # channels kept out of the 448-dim embedding
+padim-sigma = 4.0           # Gaussian blur on the anomaly map (as centralised)
+padim-float32-wire = true   # send float32 statistics (~82 MB -> ~41 MB per client)
+
 fraction-train = 1.0        # fraction of connected clients used each round
 fraction-evaluate = 1.0
 # The server waits until this many clients are connected before starting a round.

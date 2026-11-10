@@ -118,6 +118,14 @@ def build_accountant(strategy, cfg):
 @app.main()
 def main(grid: Grid, context: Context) -> None:
     cfg = context.run_config
+
+    # Federated PaDiM is a one-round statistics aggregation, not iterative
+    # gradient training: no strategy, no model weights. Hand over to its own
+    # ServerApp rather than bending the Strategy interface around it.
+    if bool(cfg.get("padim-mode", False)):
+        from aitdm_fl.padim_server_app import main as padim_main
+        return padim_main(grid, context)
+
     partitions_dir = str(cfg["partitions-dir"])
     if not partitions_dir:
         raise ValueError(

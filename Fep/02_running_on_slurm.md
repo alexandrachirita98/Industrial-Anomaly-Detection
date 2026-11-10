@@ -35,6 +35,8 @@ Any `sbatch` option **before** the job name overrides the defaults of that job, 
 | `run_seeds` | `experiments/run_seeds.py` (seeds 1, 2, 3) | haswell, 8 CPUs, 4 h |
 | `centralised` | `experiments/centralised.py` | haswell, 8 CPUs, 2 h |
 | `reproduce_tutorials` | `experiments/reproduce_tutorials.sh` | haswell, 16 CPUs, 12 h |
+| `autovi_data` | all AutoVI npz + partitions (`autovi.py`, `split_data.py`, `autovi_official_partitions.py`) | haswell, 8 CPUs, 32 GB, 2 h |
+| `padim` | `experiments/padim_experiment.py` (unsupervised baseline) | haswell, 8 CPUs, 1 h |
 | `command` | any command you give it (`split_data.py`, `gradcam.py`, ...) | haswell, 4 CPUs, 1 h |
 
 ## 1. Partitions: which queue can I use?

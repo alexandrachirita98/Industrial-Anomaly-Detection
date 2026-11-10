@@ -85,6 +85,12 @@ def client_seed(msg: Message, context: Context) -> int:
 @app.train()
 def train(msg: Message, context: Context) -> Message:
     """Receive the global model, train it on local data, send it back."""
+    # PaDiM has no model to receive and nothing to train: it returns sufficient
+    # statistics of its local normals instead (one round, no gradients).
+    if bool(context.run_config.get("padim-mode", False)):
+        from aitdm_fl.padim_client_app import collect_statistics
+        return collect_statistics(msg, context)
+
     config = msg.content["config"]
     seed = client_seed(msg, context)
     set_seed(seed)
