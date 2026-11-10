@@ -2,7 +2,12 @@
 
 One of the six unsupervised baselines benchmarked on AutoVI by Carvalho et al.
 (2024), Computers in Industry 163, 104151. Chosen because "training" is a single
-forward pass plus a mean and a covariance: no optimiser, no epochs, no GPU needed.
+forward pass plus a mean and a covariance: no optimiser, no epochs.
+
+The embedding, the covariance inversion and the Mahalanobis distance are all
+batched torch ops, so this runs on CPU or GPU with identical results (pass
+device=). At 128x128 CPU is fine; a GPU earns its keep at 400x400, where the
+patch grid is 100x100 = 9,604 positions instead of 32x32 = 1,024.
 
 Trains on NORMAL images only. Use data/partitions/autovi_official (--mode official),
 never the supervised re-split, or the AUROC is not comparable with the paper.
@@ -54,10 +59,14 @@ def _blur(m: np.ndarray, sigma: float) -> np.ndarray:
 class PaDiM:
     """Fit on normal images, score anything. No trainable parameters."""
 
-    def __init__(self, n_dims: int = 100, seed: int = 1, device=None):
+    def __init__(self, n_dims: int = 100, seed: int = 1, device=None,
+                 inv_chunk: int = 1024):
         self.n_dims = n_dims
         self.seed = seed
         self.device = device or torch.device("cpu")
+        # Patch positions inverted per torch.linalg.inv call. 1024 is the whole
+        # grid at 128x128; at 400x400 (100x100 = 9,604 positions) it chunks.
+        self.inv_chunk = inv_chunk
 
         self.backbone = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
         self.backbone.eval().to(self.device)
@@ -101,21 +110,6 @@ class PaDiM:
         self.idx = torch.as_tensor(np.asarray(idx, dtype=np.int64))
 
     @torch.no_grad()
-    def _embed_all(self, x: np.ndarray, batch_size: int) -> torch.Tensor:
-        """(N, 3, H, W) -> (N, n_dims, h, w) on the CPU, batched to bound memory.
-
-        Selects self.idx inside the loop, so only n_dims channels are ever kept:
-        at n_dims=100 that is 4.5x less memory than holding all 448.
-        Requires self.idx to be set already (_draw_channels).
-        """
-        idx = self.idx.to(self.device)
-        out = []
-        for i in range(0, len(x), batch_size):
-            batch = torch.from_numpy(x[i:i + batch_size]).to(self.device)
-            out.append(self._embed(batch)[:, idx].cpu())
-        return torch.cat(out)                        # (N, n_dims, h, w)
-
-    @torch.no_grad()
     def fit(self, x: np.ndarray, batch_size: int = 32,
             idx: np.ndarray | None = None) -> None:
         """x: (N, 3, H, W) float32 in [0,1], NORMAL images only.
@@ -130,24 +124,76 @@ class PaDiM:
                 "covariance is singular. Use more images or a smaller --n-dims.")
 
         self._draw_channels(idx)
-        emb = self._embed_all(x, batch_size)         # (N, n_dims, h, w)
-
-        n, d, h, w = emb.shape
+        # Accumulated batch by batch into sums, so peak memory depends on
+        # batch_size and not on N. The sums are the same sufficient statistics
+        # local_statistics() sends to the server, and the covariance is rebuilt
+        # from them with the SAME algebra as aggregate_statistics(): one formula
+        # for both paths instead of two that can silently drift apart.
+        #
+        # float64 throughout: Q accumulates sums of squares, and the cancellation
+        # in Q/n - mu mu^T can cost several significant digits in float32. It is
+        # also what lets tests/test_padim_federated.py hold mean to rtol 1e-12.
+        stats = self._accumulate(x, batch_size)
+        n, d = stats["n"], self.n_dims
+        h, w = stats["grid"]
         self.grid = (h, w)
-        # float64: the mean and covariance are sums over N images, and in float32
-        # the accumulation costs ~1e-6 of precision. Cheap here, and it makes this
-        # path agree exactly with the federated aggregation in padim_federated.py.
-        emb = emb.reshape(n, d, h * w).double().numpy()   # (N, d, n_patches)
 
-        self.mean = emb.mean(axis=0).T               # (n_patches, d)
-        inv = np.empty((h * w, d, d), dtype=np.float64)
-        eye = np.eye(d)
-        for p in range(h * w):
-            # rowvar=False wants (N, d); emb[:, :, p] is exactly that. Getting
-            # this backwards computes an N x N covariance and nonsense scores.
-            cov = np.cov(emb[:, :, p], rowvar=False) + COV_EPS * eye
-            inv[p] = np.linalg.inv(cov)
-        self.inv_cov = inv
+        mean = stats["S"] / n                                   # (p, d)
+        # Population second moment -> covariance, then Bessel-corrected so this
+        # matches np.cov(ddof=1) and the federated path exactly. Dropping the
+        # n/(n-1) makes the covariance quietly (n-1)/n too small; see
+        # tests/test_padim_federated.py::test_bessel_correction_is_not_cosmetic.
+        cov = stats["Q"] / n - mean[:, :, None] * mean[:, None, :]
+        cov *= n / (n - 1)
+        cov += COV_EPS * torch.eye(d, dtype=cov.dtype, device=cov.device)
+
+        self.mean = mean.cpu().numpy()
+        self.inv_cov = self._batched_inverse(cov).cpu().numpy()
+
+    def _batched_inverse(self, cov: torch.Tensor) -> torch.Tensor:
+        """Invert a (p, d, d) stack of covariances, chunked over p.
+
+        torch.linalg.inv is batched, so this is one call per chunk instead of one
+        per patch position. Chunking bounds peak memory: at 400x400 the grid is
+        100x100 = 9,604 positions, where inverting the whole stack at once needs
+        an order of magnitude more scratch space than one chunk does.
+        """
+        return torch.cat([torch.linalg.inv(c)
+                          for c in cov.split(self.inv_chunk)])
+
+    @torch.no_grad()
+    def _accumulate(self, x: np.ndarray, batch_size: int,
+                    idx: torch.Tensor | None = None) -> dict:
+        """Stream x and return {"n", "S", "Q", "grid"} as float64 torch tensors.
+
+        S = sum of embeddings, Q = sum of outer products, per patch position.
+        Shared by fit() and local_statistics() so the centralised and federated
+        paths accumulate through exactly the same arithmetic.
+        """
+        sel = (self.idx if idx is None else idx).to(self.device)
+        d = len(sel)
+        n_seen, grid, S, Q = 0, None, None, None
+        for i in range(0, len(x), batch_size):
+            batch = torch.from_numpy(x[i:i + batch_size]).to(self.device)
+            emb = self._embed(batch)[:, sel]
+            b, _, h, w = emb.shape
+            if S is None:
+                grid = (h, w)
+                S = torch.zeros(h * w, d, dtype=torch.float64, device=self.device)
+                Q = torch.zeros(h * w, d, d, dtype=torch.float64, device=self.device)
+            elif grid != (h, w):
+                raise ValueError(
+                    f"batch {i // batch_size} has grid {(h, w)}, expected {grid}: "
+                    "the client's images are not all the same size.")
+            # (b, d, h*w) -> (p, b, d): patch position first, so the per-position
+            # outer products are one batched matmul.
+            e = emb.reshape(b, d, h * w).permute(2, 0, 1).double()
+            S += e.sum(dim=1)
+            Q.baddbmm_(e.transpose(1, 2), e)        # Q += e^T e, per position
+            n_seen += b
+        if S is None:
+            raise ValueError("no images: nothing to accumulate statistics from")
+        return {"n": n_seen, "S": S, "Q": Q, "grid": grid}
 
     @torch.no_grad()
     def local_statistics(self, x: np.ndarray, idx: np.ndarray,
@@ -167,34 +213,16 @@ class PaDiM:
             raise ValueError("no training images: nothing to compute statistics from")
         self._draw_channels(idx)                     # server-chosen, never drawn here
 
-        # Accumulated batch by batch, never holding the whole embedding: client
-        # memory then depends on batch_size, not on how many images the client
-        # owns. S and Q are sums, so batching them is exact.
-        #
-        # float64: Q accumulates sums of squares, and the cancellation in
-        # Q/n - mu mu^T can cost several significant digits in float32 (and even
-        # yield a non-PSD matrix). COV_EPS hides a lot; do not rely on it to hide
-        # a numerical bug.
-        d = self.n_dims
-        n_seen, grid, S, Q = 0, None, None, None
-        for i in range(0, len(x), batch_size):
-            batch = torch.from_numpy(x[i:i + batch_size]).to(self.device)
-            emb = self._embed(batch)[:, self.idx.to(self.device)].cpu()
-            b, _, h, w = emb.shape
-            if S is None:
-                grid = (h, w)
-                S = np.zeros((h * w, d), dtype=np.float64)
-                Q = np.zeros((h * w, d, d), dtype=np.float64)
-            elif grid != (h, w):
-                raise ValueError(
-                    f"batch {i // batch_size} has grid {(h, w)}, expected {grid}: "
-                    "the client's images are not all the same size.")
-            e = emb.reshape(b, d, h * w).permute(2, 0, 1).double().numpy()  # (p, b, d)
-            S += e.sum(axis=1)
-            Q += np.einsum("pnd,pne->pde", e, e)
-            n_seen += b
-
-        return {"n": int(n_seen), "S": S, "Q": Q, "grid": grid}
+        # Exactly the same accumulation fit() uses, so a client's statistics and
+        # the centralised ones are produced by identical arithmetic - which is what
+        # makes the federated model bitwise-comparable rather than merely close.
+        # Peak memory depends on batch_size, never on how many images the client
+        # owns, because S and Q are sums.
+        stats = self._accumulate(x, batch_size)
+        # NumPy on the way out: fl_app/aitdm_fl/padim_client_app.py wraps S and Q
+        # in Flower Arrays, and aggregate_statistics() sums them with numpy.
+        return {"n": int(stats["n"]), "S": stats["S"].cpu().numpy(),
+                "Q": stats["Q"].cpu().numpy(), "grid": stats["grid"]}
 
     def load_statistics(self, mean: np.ndarray, inv_cov: np.ndarray,
                         idx: np.ndarray, grid: tuple[int, int]) -> None:
@@ -216,25 +244,31 @@ class PaDiM:
             raise RuntimeError("call fit() before score()")
         out_size = x.shape[-1]
         idx = self.idx.to(self.device)
+        # Moved to the device once, not per batch. float64 to match the fit, so
+        # the quadratic form is computed at the precision the covariance was
+        # inverted at.
+        mean = torch.as_tensor(self.mean, dtype=torch.float64, device=self.device)
+        inv_cov = torch.as_tensor(self.inv_cov, dtype=torch.float64,
+                                  device=self.device)
         scores, maps = [], []
 
         for i in range(0, len(x), batch_size):
             batch = torch.from_numpy(x[i:i + batch_size]).to(self.device)
-            emb = self._embed(batch)[:, idx].cpu().numpy()
+            emb = self._embed(batch)[:, idx]                      # (b, d, h, w)
             b, d, h, w = emb.shape
-            flat = emb.reshape(b, d, h * w)
+            # (b, d, h*w) -> (b, p, d): patch position second, so one einsum
+            # covers every position instead of a Python loop over p. This is the
+            # whole reason a GPU helps here at all.
+            e = emb.reshape(b, d, h * w).transpose(1, 2).double()
+            delta = e - mean                                      # (b, p, d)
+            # Mahalanobis distance at every position at once. clamp before sqrt:
+            # float error can make the quadratic form slightly negative and
+            # produce NaN.
+            dist = torch.einsum("bpi,pij,bpj->bp", delta, inv_cov, delta)
+            m = dist.clamp(min=0).sqrt().reshape(b, 1, h, w).float()
 
-            dist = np.empty((b, h * w), dtype=np.float64)
-            for p in range(h * w):
-                delta = flat[:, :, p] - self.mean[p]              # (b, d)
-                # Mahalanobis, batched: sum over d of (delta @ inv) * delta.
-                # Clamp at 0 so float error cannot produce a NaN in sqrt.
-                dist[:, p] = np.sqrt(np.maximum(
-                    np.einsum("bi,ij,bj->b", delta, self.inv_cov[p], delta), 0.0))
-
-            m = torch.from_numpy(dist.reshape(b, 1, h, w)).float()
             m = F.interpolate(m, size=out_size, mode="bilinear",
-                              align_corners=False).squeeze(1).numpy()
+                              align_corners=False).squeeze(1).cpu().numpy()
             m = np.stack([_blur(mi, sigma) for mi in m])
             scores.append(m.reshape(len(m), -1).max(axis=1))
             if return_maps:
