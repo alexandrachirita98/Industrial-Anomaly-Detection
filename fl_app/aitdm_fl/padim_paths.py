@@ -20,8 +20,11 @@ def _candidates(hint: str | None) -> list[Path]:
     if hint:
         # partitions-dir is an absolute repo path (data/partitions/<name>), so
         # the repo root is one of its parents. Walk up and look for experiments/.
-        p = Path(hint).resolve()
-        out.extend(parent / "experiments" for parent in [p, *p.parents])
+        # Walk the path AS GIVEN as well as the resolved one: on the cluster
+        # data/ is a symlink out of the repo (Fep/setup_fep.sh), so resolving
+        # first walks ~/AITDM_Project/... and never passes the repo root.
+        for p in dict.fromkeys([Path(hint).absolute(), Path(hint).resolve()]):
+            out.extend(parent / "experiments" for parent in [p, *p.parents])
     # Last resort: an editable/source checkout next to this file.
     out.append(Path(__file__).resolve().parents[2] / "experiments")
     return out
